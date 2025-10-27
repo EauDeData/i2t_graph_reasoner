@@ -1,0 +1,13 @@
+python main.py \
+    --num_channels 1032 \
+    --num_layers 8 \
+    --scorer_type logistic \
+    --dropout 0.1 \
+    --learning_rate 0.00005 \
+    --batch_size 16 \
+    --device cuda \
+    --path_to_training_samples /data/users/amolina/hmmkgv2/options/features_tmp.json \
+    --path_to_metadata /data/users/amolina/hmmkgv2/options/hmmkg_dataset_harder.json \
+    --blacklist_path black_list.txt \
+      --save_to /data/users/amolina/ckpts/graph_reasoning/eight_layers_5eMinus5LR.pth \
+    --use_wandb
