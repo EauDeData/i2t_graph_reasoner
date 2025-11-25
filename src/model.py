@@ -1,6 +1,7 @@
 import torch
 import torch_geometric
 from typing import *
+import torch.nn.functional as F
 
 class ScorerFunctions:
     def __init__(self, scorer, sckw):
@@ -13,7 +14,9 @@ class ScorerFunctions:
 
     @property
     def triplet(self):
-        raise NotImplementedError
+        # TODO: Explore the margin
+        return TripletLossScorer()
+
 class NoLayersProxy:
     def __init__(self):
         return None
@@ -72,16 +75,30 @@ class ConcatAndLogisticScorer(torch.nn.Module):
         return positive_vector, neagtive_vector, logits
 
 class TripletLossScorer(torch.nn.Module):
-    def __init__(self):
-        pass
+    def __init__(self, margin=1.0, **kwargs):
+        super(TripletLossScorer, self).__init__()
+        self.margin = margin
 
-    def forward(self, positive_anchors, negative_anchors, positive_texts, negative_texts, compute_loss = True):
-        if not compute_loss:
-            raise NotImplementedError(f"Inference mode is not implemented yet for triplet loss.")
-        batch = torch.concat([positive_anchors, negative_anchors, positive_texts, negative_texts], dim=0)
-        labels = torch.tensor([i for i in range(batch.shape[0] // 2)]*2, device=batch.device, dtype=torch.int16)
-        pass
+    def forward(self, positive_anchors, negative_anchors, positive_texts, negative_texts, compute_loss=True):
+        # Compute cosine similarities (only diagonal elements)
+        # Normalize embeddings
+        positive_anchors_norm = F.normalize(positive_anchors, p=2, dim=1)
+        positive_texts_norm = F.normalize(positive_texts, p=2, dim=1)
+        negative_anchors_norm = F.normalize(negative_anchors, p=2, dim=1)
+        negative_texts_norm = F.normalize(negative_texts, p=2, dim=1)
+        
+        # Element-wise multiplication and sum along feature dimension
+        positive_cosine_similarities = (positive_anchors_norm * positive_texts_norm).sum(dim=1)
+        negative_cosine_similarities = (negative_anchors_norm * negative_texts_norm).sum(dim=1)
 
+        if compute_loss:
+            # Use triplet loss: anchor, positive, negative
+            # We need to align the batch dimensions
+            loss = torch.clamp(((1 - positive_cosine_similarities) - (1 - negative_cosine_similarities)) + self.margin, 0).mean()
+            
+            return (positive_anchors_norm, positive_texts_norm), (negative_anchors, negative_texts_norm), (positive_cosine_similarities, negative_cosine_similarities), loss
+        
+        return (positive_anchors_norm, positive_texts_norm), (negative_anchors, negative_texts_norm), (positive_cosine_similarities, negative_cosine_similarities)
 class ManyGraphLayers(torch.nn.Module):
     def __init__(self, layer_class, init_params: dict, num_layers: int):
         super().__init__()
@@ -106,7 +123,7 @@ class GATReasoningScorer(torch.nn.Module):
         self.num_layers = self.num_steps = self.num_messages = num_layers
 
         self.drop_edges = False
-        if num_layers:
+        if num_layers > 0:
             if graph_layer_type == 'gat':
                 self.gat = torch_geometric.nn.GAT(in_channels=num_channels, hidden_channels=num_channels, out_channels=num_channels, num_layers=num_layers, v2=True, dropout=dropout)
                 self.add_edge_types = False
@@ -146,6 +163,8 @@ class GATReasoningScorer(torch.nn.Module):
         scorer_builder = ScorerFunctions(self, scorer_kwargs)
         if scorer_type == 'logistic':
             self.scorer = scorer_builder.logistic
+        elif scorer_type == 'triplet':
+            self.scorer = scorer_builder.triplet
         else:
             raise NotImplementedError(f"Not implemented scorer {scorer_type}")
 

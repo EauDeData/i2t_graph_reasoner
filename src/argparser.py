@@ -12,7 +12,7 @@ def get_args():
     # Model parameters
     parser.add_argument('--num_channels', type=int, required=True, help='Number of channels in the model')
     parser.add_argument('--num_layers', type=int, required=True, help='Number of layers in the model')
-    parser.add_argument('--scorer_type', type=str, default='logistic', choices=['logistic', 'softmax'], help='Type of scorer')
+    parser.add_argument('--scorer_type', type=str, default='logistic', choices=['logistic', 'softmax', 'triplet'], help='Type of scorer')
     parser.add_argument('--graph_type', type=str, default='gat', choices=['grav', 'pna', 'gat', 'relational', 'sage', 'trf', 'pathfinder'], help='Type of message passing')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--use_directed', action='store_true', help='Whether to use directed graphs')
@@ -23,6 +23,13 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
     parser.add_argument('--use_loss_weights', action='store_true', help='')
     parser.add_argument('--use_single_gpu', action='store_true', help='Whether to use a single gpu')
+    parser.add_argument('--use_random_negative_sampler', action='store_true', help='Whether to use a single gpu')
+
+    parser.add_argument('--bridge_ocr_and_ners', action='store_true', help='Whether to use a single gpu')
+    parser.add_argument('--use_observation_only', action='store_true', help='Whether to use a single gpu')
+    parser.add_argument('--use_unshuffled', action='store_true', help='Whether to use a single gpu')
+
+    parser.add_argument('--eval_on_batched', action='store_true', help='Whether to use a single gpu')
 
 
     # Paths

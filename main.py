@@ -26,13 +26,14 @@ def main():
     # -------------------------
     # Load dataset
     # -------------------------
-    dataset = HMMMKGDataset(args.path_to_training_samples, args.path_to_metadata)
+    print('Will shuffle:', not args.use_unshuffled)
+    dataset = HMMMKGDataset(args.path_to_training_samples, args.path_to_metadata, random_negative_sampler=args.use_random_negative_sampler)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=16,
-        shuffle=True,
-        collate_fn=Collator(to_directed=args.use_directed).collate_fn
+        shuffle=not args.use_unshuffled,
+        collate_fn=Collator(to_directed=args.use_directed, bridge_ners_to_ocr = args.bridge_ocr_and_ners, use_observation_only=args.use_observation_only).collate_fn
     )
 
     # -------------------------

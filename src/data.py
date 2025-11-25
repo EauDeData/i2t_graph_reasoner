@@ -10,6 +10,12 @@ import itertools
 import json
 import torch
 from networkx.classes import edges
+from annoy import AnnoyIndex
+import random
+
+VECTOR_DATABASE_PATH = '/data/users/amolina/hmmkgv2/options/index/vdb.ann'
+VECTOR_METADATA_PATH = '/data/users/amolina/hmmkgv2/options/index/metaindex.json'
+
 
 class HMMMKGDataset(torch.utils.data.Dataset):
     """
@@ -51,7 +57,7 @@ class HMMMKGDataset(torch.utils.data.Dataset):
     For each sample, all incorrect options are paired with the correct option.
     """
 
-    def __init__(self, path_to_training_samples: str, path_to_metadata: str,  blacklist_path: str = "black_list.txt"):
+    def __init__(self, path_to_training_samples: str, path_to_metadata: str,  blacklist_path: str = "black_list.txt", random_negative_sampler = False):
         """
         Initialize the dataset.
 
@@ -68,7 +74,7 @@ class HMMMKGDataset(torch.utils.data.Dataset):
         self.av_options = {os.path.splitext(file_id['file_id'])[0]: set(file_id['options'].values()) for file_id in metadata}
         self.triplets = self._build_triplets()
         self.filter_blacklist()
-
+        self.random_negative_sampler = random_negative_sampler
     def filter_blacklist(self):
         # Filter blacklisted items
         if os.path.exists(self.blacklist_path):
@@ -160,6 +166,8 @@ class HMMMKGDataset(torch.utils.data.Dataset):
 
         # Open using read graphml from NX
         image_graph_path, correct_query_path, incorrect_query_path = self.triplets[idx]
+        if self.random_negative_sampler:
+            _, _, incorrect_option_graph_path = self.triplets[random.randint(0, len(self) - 1)]
 
         image_graph = nx.read_graphml(image_graph_path)
         correct_text_graph = nx.read_graphml(correct_query_path)
@@ -326,7 +334,7 @@ class HMMKFDatasetEval(HMMMKGDataset):
 
 class Collator:
 
-    def __init__(self, to_directed):
+    def __init__(self, to_directed, bridge_ners_to_ocr = False, use_observation_only = False):
 
         def _build_edge_type_mapping(num_node_types: int = 8):
             """
@@ -357,10 +365,42 @@ class Collator:
             return allowed_with_idxs
 
         print('Using directed graph is:', to_directed)
+        self.bridge_ners_to_ocr = bridge_ners_to_ocr
         self.edge_type_dict, self.edge_type_list = _build_edge_type_mapping()
         self.directed_allowed_edges = _build_directionality_constraints(self.edge_type_dict)
         self.convert_to_directed = to_directed
+        self.use_observation_only = use_observation_only
 
+        self.metadata_vdb = json.load(open(VECTOR_METADATA_PATH))
+        self.vdb = AnnoyIndex(1032, 'angular')
+        self.vdb.load(VECTOR_DATABASE_PATH)
+
+    def _bridge_ners(self, composed_graph, node_list, features):
+        # 1.5 Incorporate the ocr <----> ners with a "is in" condition
+        # Get node features to determine node types
+        other_nodes = [(n, f) for n, f in zip(node_list, features) if f[-8:].index(1) in [4, 5]]
+        for node, node_feat in zip(node_list, features):
+            
+            node_type_vector = node_feat[-8:]  # Last 8 positions are one-hot encoded type
+            node_type_idx = node_type_vector.index(1) if 1 in node_type_vector else -1
+            
+            # If this is an OCR node (type index 2)
+            if node_type_idx == 2:
+                ocr_text = str(node).lower()
+                
+                # Check against all other nodes for NER (type 4) and NOUN (type 5) nodes
+                for other_node, other_feat in other_nodes:
+
+                    other_text = str(other_node)
+                    
+                    # Check if any word from the NER/NOUN appears in the OCR text
+                    # Handle titles like Mr., Sr., etc. that might have dots
+                    words = other_text.split(' ')
+                    if any(word.lower() in ocr_text for i, word in enumerate(words)):
+                        # Add bidirectional edge
+                        composed_graph.add_edge(node, other_node)
+
+        return composed_graph
 
     def collate_fn(self, batch):
         """
@@ -405,10 +445,16 @@ class Collator:
 
         # 3. Collect features
         features = []
+        list_of_features = []
         for node in node_list:
 
-            feat = json.loads(composed_graph.nodes[node]['features'])
+            feat = self.vdb.get_item_vector(self.metadata_vdb[node])
             features.append(torch.tensor(feat, dtype=torch.float))
+            list_of_features.append(feat)
+
+        # 1.5 Incorporate the ocr <----> ners with a "is in" condition
+        if self.bridge_ners_to_ocr:
+            composed_graph = self._bridge_ners(composed_graph, node_list, list_of_features)
 
         features = torch.stack(features, dim=0)  # [N, F]
 
@@ -423,6 +469,9 @@ class Collator:
             negative_idxs.append(neg_idx)
 
         edges = [[node_to_idx[nin], node_to_idx[nout]] for nin, nout in composed_graph.edges()]
+        if self.use_observation_only:
+            edges = [z for z in edges if not ((torch.argmax(features[z[0], -8:]).item() in [6, 7]) or (torch.argmax(features[z[0], -8:]).item() in [6, 7]))]
+
         edges = edges + [x[::-1] for x in edges] # We need to do it symetric
 
         edge_types = []
@@ -454,15 +503,21 @@ class Collator:
 
         def _build_graph_data(graph, pair):
             """Helper to build node features, edges, and pair indices from a merged graph."""
+
+
             node_list = list(graph.nodes())
             node_to_idx = {n: i for i, n in enumerate(node_list)}
 
-            # Features
+            # 3. Collect features
             features = []
-            for n in node_list:
-                feat = json.loads(graph.nodes[n]['features'])
+            list_of_features = []
+            for node in node_list:
+                feat = self.vdb.get_item_vector(self.metadata_vdb[node])
                 features.append(torch.tensor(feat, dtype=torch.float))
+                list_of_features.append(feat)
             features = torch.stack(features, dim=0)  # [N, F]
+            if self.bridge_ners_to_ocr:
+                graph = self._bridge_ners(graph, node_list, list_of_features)
 
             # Edges (make symmetric)
             edges = [[node_to_idx[a], node_to_idx[b]] for a, b in graph.edges()]
@@ -513,7 +568,6 @@ class Collator:
         for image_graph, correct_text_graph, incorrect_text_graphs, pos_pair, neg_pairs in batch:
             sample_graphs = []  # [positive_merged_graph, neg_graph1, ...]
 
-            # --- Positive merged graph ---
             pos_graph = nx.compose(image_graph, correct_text_graph)
             pos_graph_data = _build_graph_data(pos_graph, pos_pair)
             sample_graphs.append(pos_graph_data)
@@ -527,6 +581,115 @@ class Collator:
             all_results.append(sample_graphs)
 
         return all_results
+
+
+    def eval_collate_fn_whole_batch(self, batch):
+        """
+        Evaluation collate function — builds a single batched graph containing all samples.
+        Each sample includes: 1 positive pair + N negative pairs.
+
+        Returns a single dict with:
+            - Batched graph data (node_features, edges, edge_types, batch indices)
+            - All pairs (positive first, then negatives for each sample)
+            - Labels (1 for positive, 0 for negatives)
+        """
+
+        all_node_features = []
+        all_edges = []
+        all_edge_types = []
+        all_pairs = []
+        all_labels = []
+        all_batch_indices = []
+
+        node_offset = 0
+
+        for batch_idx, (image_graph, correct_text_graph, incorrect_text_graphs, pos_pair, neg_pairs) in enumerate(batch):
+            # --- Positive merged graph ---
+            pos_graph = nx.compose(image_graph, correct_text_graph)
+            pos_data = self._build_graph_data_for_batch(pos_graph, pos_pair, node_offset)
+
+            all_node_features.append(pos_data['node_features'])
+            all_edges.append(pos_data['edges'])
+            all_edge_types.append(pos_data['edge_types'])
+            all_pairs.append(pos_data['pair'])
+            all_labels.append(1)  # Positive
+            all_batch_indices.extend([batch_idx] * pos_data['node_features'].shape[0])
+
+            node_offset += pos_data['node_features'].shape[0]
+
+            # --- Negative merged graphs ---
+            for incorrect_graph, neg_pair in zip(incorrect_text_graphs, neg_pairs):
+                neg_graph = nx.compose(image_graph, incorrect_graph)
+                neg_data = self._build_graph_data_for_batch(neg_graph, neg_pair, node_offset)
+
+                all_node_features.append(neg_data['node_features'])
+                all_edges.append(neg_data['edges'])
+                all_edge_types.append(neg_data['edge_types'])
+                all_pairs.append(neg_data['pair'])
+                all_labels.append(0)  # Negative
+                all_batch_indices.extend([batch_idx] * neg_data['node_features'].shape[0])
+
+                node_offset += neg_data['node_features'].shape[0]
+
+        # Concatenate everything
+        return {
+            'node_features': torch.cat(all_node_features, dim=0),
+            'edges': torch.cat(all_edges, dim=1),
+            'edge_types': torch.cat(all_edge_types, dim=0),
+            'pairs': torch.tensor(all_pairs, dtype=torch.long),
+            'labels': torch.tensor(all_labels, dtype=torch.long),
+            'batch': torch.tensor(all_batch_indices, dtype=torch.long)
+        }
+
+
+    def _build_graph_data_for_batch(self, graph, pair, node_offset):
+        """Helper to build graph data with node offset for batching."""
+        node_list = list(graph.nodes())
+        node_to_idx = {n: i + node_offset for i, n in enumerate(node_list)}
+
+        # Collect features
+        features = []
+        list_of_features = []
+        for node in node_list:
+            feat = self.vdb.get_item_vector(self.metadata_vdb[node])
+            features.append(torch.tensor(feat, dtype=torch.float))
+            list_of_features.append(feat)
+        features = torch.stack(features, dim=0)
+
+        if self.bridge_ners_to_ocr:
+            graph = self._bridge_ners(graph, node_list, list_of_features)
+
+        # Edges (make symmetric)
+        edges = [[node_to_idx[a], node_to_idx[b]] for a, b in graph.edges()]
+        edges = edges + [x[::-1] for x in edges]
+
+        edge_types = []
+        filtered_edges = []
+
+        for src, dst in edges:
+            # Get original indices (without offset) for feature lookup
+            src_local = src - node_offset
+            dst_local = dst - node_offset
+            src_type = torch.argmax(features[src_local, -8:]).item()
+            dst_type = torch.argmax(features[dst_local, -8:]).item()
+            node_pair = (src_type, dst_type)
+            edge_type_idx = self.edge_type_dict[node_pair]
+
+            if not self.convert_to_directed or edge_type_idx in self.directed_allowed_edges:
+                filtered_edges.append([src, dst])
+                edge_types.append(edge_type_idx)
+
+        edges = torch.tensor(filtered_edges, dtype=torch.long).T if filtered_edges else torch.empty((2, 0),
+                                                                                                    dtype=torch.long)
+
+        pair_idx = (node_to_idx[pair[0]], node_to_idx[pair[1]])
+
+        return {
+            "edges": edges,
+            "node_features": features,
+            "pair": pair_idx,
+            'edge_types': torch.tensor(edge_types, dtype=torch.long)
+        }
 
 def get_blacklist_from_dataset(dataset, BLACKLIST_PATH):
 

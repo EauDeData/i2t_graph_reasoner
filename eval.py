@@ -27,13 +27,14 @@ def main():
 
     dataset = HMMKFDatasetEval(args.path_to_training_samples, args.path_to_metadata, args.blacklist_path)
     # dataset.create_blacklist()
-
+    col = Collator(to_directed=args.use_directed, bridge_ners_to_ocr = args.bridge_ocr_and_ners)
+    print(f"Eval on batched: {args.eval_on_batched}")
     dataloader = DataLoader(
         dataset,
         batch_size=1,
         num_workers=0,
         shuffle=False,
-        collate_fn=Collator(to_directed=args.use_directed).eval_collate_fn
+        collate_fn= col.eval_collate_fn if not args.eval_on_batched else col.eval_collate_fn_whole_batch
     )
 
     scorer_kwargs = {'use_weights': args.use_loss_weights, 'device': device}
@@ -56,46 +57,94 @@ def main():
     for batch in tqdm.tqdm(dataloader, desc="Evaluating"):
         # Because batch_size=1, dataloader yields a list with one sample:
         #   batch = [ [pos_graph_dict, neg_graph1_dict, ...] ]
-        for i in range(len(batch)):
-            sample_graphs = batch[i]
 
-            sample_scores = []
-            sample_labels = []
+        if not args.eval_on_batched:
 
-            # Process each merged graph independently
-            for i, graph_dict in enumerate(sample_graphs):
-                # Build model input dict
-                model_input = dict(edges=graph_dict['edges'].to(device),
-                                   node_features=graph_dict['node_features'].to(device),
-                                   true_pairs=torch.tensor([graph_dict['pair']], dtype=torch.long, device=device),
-                                   negative_pairs=torch.empty((0, 2), dtype=torch.long, device=device),
-                                   compute_loss=False,
-                                   edge_types=graph_dict['edge_types'])
+            for i in range(len(batch)):
 
-                model_input['edges'] = model_input['edges'].to(device)
-                model_input['node_features'] = model_input['node_features'].to(device)
-                model_input['compute_loss'] = False
-                model_input['edge_types'] = model_input['edge_types'].to(device)
+                sample_graphs = batch[i]
 
-                data = Data(x=model_input.pop('node_features'), edge_index=model_input.pop('edges'),
-                            edge_attr=model_input.pop('edge_types'))
+                sample_scores = []
+                sample_labels = []
 
-                # Forward pass
-                _, _, score = model(data, model_input)
+                # Process each merged graph independently
+                for i, graph_dict in enumerate(sample_graphs):
+                    # Build model input dict
+                    model_input = dict(edges=graph_dict['edges'].to(device),
+                                       node_features=graph_dict['node_features'].to(device),
+                                       true_pairs=torch.tensor([graph_dict['pair']], dtype=torch.long, device=device),
+                                       negative_pairs=torch.empty((0, 2), dtype=torch.long, device=device),
+                                       compute_loss=False,
+                                       edge_types=graph_dict['edge_types'])
 
-                sample_scores.append(score)
-                sample_labels.append(1 if i == 0 else 0)  # first is positive, others are negatives
+                    model_input['edges'] = model_input['edges'].to(device)
+                    model_input['node_features'] = model_input['node_features'].to(device)
+                    model_input['compute_loss'] = False
+                    model_input['edge_types'] = model_input['edge_types'].to(device)
 
+                    data = Data(x=model_input.pop('node_features'), edge_index=model_input.pop('edges'),
+                                edge_attr=model_input.pop('edge_types'))
+
+                    # Forward pass
+                    _, _, score = model(data, model_input)
+
+                    sample_scores.append(score)
+                    sample_labels.append(1 if i == 0 else 0)  # first is positive, others are negatives
+
+                results.append({
+                    "scores": sample_scores,
+                    "labels": sample_labels
+                })
+        else:
+
+
+            batch_data = batch
+
+            # Move to device
+            node_features = batch_data['node_features'].to(device)
+            edges = batch_data['edges'].to(device)
+            edge_types = batch_data['edge_types'].to(device)
+            pairs = batch_data['pairs'].to(device)
+            labels = batch_data['labels'].to(device)
+
+            batch_indices = batch_data['batch'].to(device)
+
+            # Create PyG Data object
+            data = Data(
+                x=node_features,
+                edge_index=edges,
+                edge_attr=edge_types,
+                batch=batch_indices
+            )
+
+            # Prepare model input (all pairs are "positive" since we're just scoring them)
+            model_input = {
+                'true_pairs': pairs,  # All pairs to score
+                'negative_pairs': torch.empty((0, 2), dtype=torch.long, device=device),
+                'compute_loss': False
+            }
+
+            # Forward pass - get scores for all pairs at once
+            _, _, scores = model(data, model_input)
+
+
+            scores_list = scores.cpu().tolist()
             results.append({
-                "scores": sample_scores,
-                "labels": sample_labels
+                "scores": scores_list,
+                "labels": labels.cpu().tolist()
             })
 
     metrics_list = []
     for sample in tqdm.tqdm(results, 'calculating metrics...'):
         # Untensorize
-        scores = [float(s.cpu().item()) for s in sample['scores']]
-        labels = np.array(sample['labels'])
+        if args.eval_on_batched:
+            # Scores and labels are already lists/numpy arrays
+            scores = sample['scores']  # Already converted to list in batched mode
+            labels = np.array(sample['labels'])
+        else:
+            # Scores are tensors, need to convert
+            scores = [float(s.cpu().item()) for s in sample['scores']]
+            labels = np.array(sample['labels'])
 
         # Sort by descending score
         sorted_indices = np.argsort(scores)[::-1]
